@@ -14,27 +14,34 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.util.HashMap;
 import java.util.Map;
-
-import org.duracloud.client.ContentStore;
-import org.duracloud.client.ContentStoreManager;
-import org.duracloud.client.ContentStoreManagerImpl;
-import org.duracloud.common.model.Credential;
-import org.duracloud.domain.Content;
-import org.duracloud.error.ContentStoreException;
-import org.duracloud.error.NotFoundException;
+import org.apache.log4j.Logger;
 
 import org.dspace.core.ConfigurationManager;
 import org.dspace.ctask.replicate.ObjectStore;
 import org.dspace.curate.Utils;
 
+import org.duracloud.client.ContentStore;
+import org.duracloud.client.ContentStoreManager;
+import org.duracloud.client.ContentStoreManagerImpl;
+import org.duracloud.common.model.Credential;
+import org.duracloud.common.retry.ExceptionHandler;
+import org.duracloud.common.retry.Retriable;
+import org.duracloud.common.retry.Retrier;
+import org.duracloud.domain.Content;
+import org.duracloud.error.ContentStoreException;
+import org.duracloud.error.NotFoundException;
+
 /**
- * DuraCloudReplicaStore invokes the DuraCloud RESTful web service API,
- * (using a java client library) rather than using the rsync tool.
+ * DuraCloudObjectStore interacts with DuraCloud using its RESTful web service API
+ * (via its java client library)
  *
  * @author richardrodgers
+ * @author tdonohue
  */
 public class DuraCloudObjectStore implements ObjectStore
 {
+    private Logger log = Logger.getLogger(DuraCloudObjectStore.class);
+    
     // DuraCloud store
     private ContentStore dcStore = null;
     
@@ -42,6 +49,13 @@ public class DuraCloudObjectStore implements ObjectStore
     {
     }
 
+    /**
+     * Initialize object storage by ensuring the connection to DuraCloud works.
+     * This actually authenticates to DuraCloud using the info in your
+     * duracloud.cfg configuration file.
+     * 
+     * @throws IOException 
+     */
     @Override
     public void init() throws IOException
     {
@@ -64,29 +78,32 @@ public class DuraCloudObjectStore implements ObjectStore
         }
     }
 
+    /**
+     * Download a specified object (based on 'id') from DuraCloud, saving
+     * its contents to a local file.
+     * @param group Name of 'space' in DuraCloud where object exists
+     * @param id ID/Name of Object to download
+     * @param file Local file to save contents to
+     * @return size of file downloaded
+     * @throws IOException 
+     */
     @Override
     public long fetchObject(String group, String id, File file) throws IOException
     {
         long size = 0L;
         try
         {
-             // DEBUG REMOVE
-            long start = System.currentTimeMillis();
+            // Download content from DuraCloud
             Content content = dcStore.getContent(getSpaceID(group), getContentPrefix(group) + id);
-            // DEBUG REMOVE
-            long elapsed = System.currentTimeMillis() - start;
-            //System.out.println("DC fetch content: " + elapsed);
+            // Get size of downloaded file
             size = Long.valueOf(content.getProperties().get(ContentStore.CONTENT_SIZE));
+            
+            // Write to a local file
             FileOutputStream out = new FileOutputStream(file);
-            // DEBUG remove
-            start = System.currentTimeMillis();
             InputStream in = content.getStream();
             Utils.copy(in, out);
             in.close();
             out.close();
-             // DEBUG REMOVE
-            elapsed = System.currentTimeMillis() - start;
-            //System.out.println("DC fetch download: " + elapsed);
         }
         catch (NotFoundException nfE)
         {
@@ -99,6 +116,13 @@ public class DuraCloudObjectStore implements ObjectStore
         return size;
     }
     
+    /**
+     * Check if an object exists in DuraCloud
+     * @param group Name of 'space' in DuraCloud where object may exist
+     * @param id ID/Name of Object to look for
+     * @return true if exists, false otherwise
+     * @throws IOException 
+     */
     @Override
     public boolean objectExists(String group, String id) throws IOException
     {
@@ -116,6 +140,13 @@ public class DuraCloudObjectStore implements ObjectStore
         }
     }
 
+    /**
+     * Delete a specified object from DuraCloud
+     * @param group Name of 'space' in DuraCloud where object exists
+     * @param id ID/Name of Object to delete
+     * @return size of file deleted
+     * @throws IOException 
+     */
     @Override
     public long removeObject(String group, String id) throws IOException
     {
@@ -138,6 +169,13 @@ public class DuraCloudObjectStore implements ObjectStore
         return size;
     }
 
+    /**
+     * Upload/transfer a local file to DuraCloud
+     * @param group Name of 'space' in DuraCloud where object should be saved
+     * @param file Local file to upload
+     * @return size of file deleted
+     * @throws IOException 
+     */
     @Override
     public long transferObject(String group, File file) throws IOException
     {
@@ -167,33 +205,106 @@ public class DuraCloudObjectStore implements ObjectStore
         return size;
     }
 
-    private long uploadReplica(String group, File file, String chkSum) throws IOException
+    /**
+     * Attempt (multiple times) to upload a local file to DuraCloud.
+     * <P>
+     * DuraCloud recommends performing multiple attempts (and even has some of 
+     * its retry logic built in), just because Amazon S3 can sometimes experience
+     * random request failures (i.e. network hiccups), especially with larger
+     * files.
+     * 
+     * @param group Name of 'space' in DuraCloud where object should be saved
+     * @param file Local file to upload
+     * @param chkSum Checksum of local file (passed to DuraCloud for 
+     *      verification of a successful upload)
+     * @return size of file uploaded
+     * @throws IOException 
+     */
+    private long uploadReplica(final String group, final File file, final String chkSum) throws IOException
     {
         try
         {
-            //@TODO: We shouldn't need to pass a hardcoded MIME Type. Unfortunately, DuraCloud, 
-            // as of 1.3, doesn't properly determine a file's MIME Type. In future it should.
-            String mimeType = "application/octet-stream";
-            if(file.getName().endsWith(".zip"))
-                mimeType = "application/zip";
-            else if (file.getName().endsWith(".tgz"))
-                mimeType = "application/x-gzip";
-            else if(file.getName().endsWith(".txt"))
-                mimeType = "text/plain";
-            
+            // Initialize a DuraCloud "Retrier" to attempt the upload multiple 
+            // times (3 by default), if at first it fails.
+            Retrier retrier = new Retrier();
+            //Run the retrier, passing it a custom Retriable & ExceptionHandler
+            return retrier.execute(
+                new Retriable() {
+                    @Override
+                    public Long retry() throws IOException
+                    {
+                        // This is the actual method to be retried (if it fails)
+                        doUpload(group, file, chkSum);
+                        
+                        // If upload succeeds, return the length of the file
+                        return file.length();
+                    }
+                }, 
+                new ExceptionHandler() {
+                    @Override
+                    public void handle(Exception ex) {
+                        // Log a custom error if a single upload fails. 
+                        // This gives us a sense of how frequently failure may be happening
+                        log.error("Upload of " + file.getName() + " to DuraCloud space " + group + " FAILED (but will try again a total of 3 times)", ex);
+                    }
+                }
+            );
+        }
+        catch (Exception e)
+        {
+            throw new IOException(e);
+        } 
+        
+    }
+
+    /**
+     * Actually perform the Upload to DuraCloud.
+     * @param group Name of 'space' in DuraCloud where object should be saved
+     * @param file Local file to upload
+     * @param chkSum Checksum of local file (passed to DuraCloud for 
+     *      verification of a successful upload)
+     * @throws IOException 
+     */
+    private void doUpload(String group, File file, String chkSum) throws IOException
+    {
+        //@TODO: We shouldn't need to pass a hardcoded MIME Type. Unfortunately, 
+        // DuraCloud doesn't (yet) dynamically determine a file's MIME Type.
+        String mimeType = "application/octet-stream";
+        if(file.getName().endsWith(".zip"))
+            mimeType = "application/zip";
+        else if (file.getName().endsWith(".tgz"))
+            mimeType = "application/x-gzip";
+        else if(file.getName().endsWith(".txt"))
+            mimeType = "text/plain";
+
+        FileInputStream fis = null;
+        try
+        {
+            fis = new FileInputStream(file);
             dcStore.addContent(getSpaceID(group), getContentPrefix(group) + file.getName(),
-                               new FileInputStream(file), file.length(),
+                               fis, file.length(),
                                mimeType, chkSum,
                                new HashMap<String, String>());
-        
-            return file.length();
         }
         catch (ContentStoreException csE)
         {
             throw new IOException(csE);
         }
-    }
+        finally
+        {
+            if (fis != null)
+                fis.close();
+        }
+     }
 
+    /**
+     * Move an object in DuraCloud from one location (space) to another
+     * @param srcGroup source location (a space in DuraCloud)
+     * @param destGroup destination location (another space in DuraCloud)
+     * @param id ID/Name of object to move
+     * @return size of moved object
+     * @throws IOException 
+     */
     @Override
     public long moveObject(String srcGroup, String destGroup, String id) throws IOException
     {
@@ -217,6 +328,14 @@ public class DuraCloudObjectStore implements ObjectStore
         return size;
     }
     
+    /**
+     * Read a single attribute (i.e. property) of an object within DuraCloud
+     * @param group Name of 'space' in DuraCloud where object exists
+     * @param id ID/Name of object
+     * @param attrName attribute (property) to return the value of
+     * @return String value of specified property in DuraCloud
+     * @throws IOException 
+     */
     @Override
     public String objectAttribute(String group, String id, String attrName) throws IOException
     {
@@ -248,6 +367,11 @@ public class DuraCloudObjectStore implements ObjectStore
         }
     }
     
+    /**
+     * Read a configuration setting from the duracloud.cfg file
+     * @param name name of configuration setting to read
+     * @return String value of configuration setting
+     */
     private static String localProperty(String name)
     {
         return ConfigurationManager.getProperty("duracloud", name);

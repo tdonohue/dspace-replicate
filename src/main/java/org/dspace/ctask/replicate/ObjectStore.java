@@ -36,8 +36,8 @@ public interface ObjectStore {
     /**
      * Obtains attributes of the representation of the object with passed ID.
      * 
-     * @param group
-     * @param id
+     * @param group - Location where object exists (e.g. folder or similar)
+     * @param id - ID/Name of remote object
      * @param attrName - name of the attribute
      * @return value of the attribute if it exists, else null
      * @throws IOException
@@ -47,8 +47,9 @@ public interface ObjectStore {
     /**
      * Fetches a copy of the object with passed ID, and places it in passed file.
      * 
-     * @param group
-     * @param id
+     * @param group - Location where object exists (e.g. folder or similar)
+     * @param id - ID/Name of remote object
+     * @param file - local file to save to
      * @return number of bytes the replica used
      * @throws IOException
      */
@@ -72,16 +73,18 @@ public interface ObjectStore {
      * @param id the id of the object to remove
      * @return number of bytes the object was using, or 0 if
      *         object did not exist.
+     * @throws IOException
      */
     long removeObject(String group, String id) throws IOException;
     
     /**
      * Moves the passed object from one storage group to another.
      * 
-     * @param srcGroup source group
+     * @param srcgroup source group
      * @param destGroup destination group
      * @param id the id of the object to move between groups
      * @return number of bytes moved or 0 if move failed.
+     * @throws IOException
      */
     long moveObject(String srcgroup, String destGroup, String id) throws IOException;
 }

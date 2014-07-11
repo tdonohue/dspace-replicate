@@ -20,10 +20,10 @@
     </parent>
   
     <properties>
-        <!-- DSpace Version Information (supported version of DSpace) -->
-        <dspace.version>[3.0,4.0)</dspace.version>
+        <!-- DSpace Version Information (supported version of DSpace, currently 3.x and 4.x) -->
+        <dspace.version>[3.0,5.0)</dspace.version>
         <!-- DuraCloud Version Information (supported version of DuraCloud) -->
-        <duracloud.version>2.3.1</duracloud.version>
+        <duracloud.version>3.1.1</duracloud.version>
     </properties>
   
     <build>
