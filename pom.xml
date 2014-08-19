@@ -16,14 +16,16 @@
     <parent>
         <groupId>org.sonatype.oss</groupId>
         <artifactId>oss-parent</artifactId>
-        <version>7</version>
+        <version>9</version>
     </parent>
   
     <properties>
         <!-- DSpace Version Information (supported version of DSpace, currently 3.x and 4.x) -->
         <dspace.version>[3.0,5.0)</dspace.version>
         <!-- DuraCloud Version Information (supported version of DuraCloud) -->
-        <duracloud.version>3.1.1</duracloud.version>
+        <duracloud.version>3.2.0-SNAPSHOT</duracloud.version>
+        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+        <java.version>1.7</java.version>        
     </properties>
   
     <build>
@@ -34,13 +36,13 @@
                 <artifactId>maven-compiler-plugin</artifactId>
                 <version>3.1</version>
                 <configuration>
-                  <source>1.7</source>
-                  <target>1.7</target>
+                  <source>${java.version}</source>
+                  <target>${java.version}</target>
                 </configuration>
             </plugin>
             <plugin>
                 <artifactId>maven-release-plugin</artifactId>
-                <version>2.3.2</version>
+                <version>2.5</version>
             </plugin>
             <!-- Copy necessary Runtime Depenencies to /target/lib/
                  during build process. (We are only including Runtime
@@ -71,8 +73,13 @@
     <repositories>
         <repository>
             <id>duracloud-releases</id>
-            <url>https://m2.duraspace.org/content/repositories/releases</url>
+            <url>http://m2.duraspace.org/content/repositories/releases</url>
         </repository>
+        <!-- DuraCloud Snapshot releases. Can temporarily enable for development/testing -->
+        <repository>
+            <id>duracloud-snapshots</id>
+            <url>http://m2.duraspace.org/content/repositories/snapshots</url>
+        </repository>         
     </repositories>
   
     <!--

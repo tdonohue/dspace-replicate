@@ -41,10 +41,23 @@ import org.duracloud.error.NotFoundException;
 public class DuraCloudObjectStore implements ObjectStore
 {
     private Logger log = Logger.getLogger(DuraCloudObjectStore.class);
-    
-    // DuraCloud store
+
+    // DuraCloud store global reference (used be all methods)
     private ContentStore dcStore = null;
-    
+
+    // Our default ExceptionHandler for the DuraCloud ContentStore
+    // We want to log a warning if DuraCloud responds with an error
+    // code to any request. By default, DuraCloud will retry any
+    // ContentStore request 3 times.
+    private ExceptionHandler defaultExceptionHandler = new ExceptionHandler() {
+        @Override
+        public void handle(Exception ex) {
+            // Log a custom warning message for errors
+            log.warn("DuraCloud responded with an error (but will retry this request up to 3 times): " + ex.getMessage());
+        }
+    };
+
+
     public DuraCloudObjectStore()
     {
     }
@@ -53,8 +66,8 @@ public class DuraCloudObjectStore implements ObjectStore
      * Initialize object storage by ensuring the connection to DuraCloud works.
      * This actually authenticates to DuraCloud using the info in your
      * duracloud.cfg configuration file.
-     * 
-     * @throws IOException 
+     *
+     * @throws IOException
      */
     @Override
     public void init() throws IOException
@@ -64,16 +77,19 @@ public class DuraCloudObjectStore implements ObjectStore
             new ContentStoreManagerImpl(localProperty("host"),
                                         localProperty("port"),
                                         localProperty("context"));
-        Credential credential = 
+        Credential credential =
             new Credential(localProperty("username"), localProperty("password"));
         storeManager.login(credential);
         try
         {
-            //Get the primary content store (e.g. Amazon)   
+            //Get the primary content store (e.g. Amazon)
             dcStore = storeManager.getPrimaryContentStore();
+
+            // Override ContentStore ExceptionHandler with our default
+            dcStore.setRetryExceptionHandler(this.defaultExceptionHandler);
         }
         catch (ContentStoreException csE)
-        {      
+        {
             throw new IOException("Unable to connect to the DuraCloud Primary Content Store. Please check the DuraCloud connection/authentication settings in your 'duracloud.cfg' file.", csE);
         }
     }
@@ -85,7 +101,7 @@ public class DuraCloudObjectStore implements ObjectStore
      * @param id ID/Name of Object to download
      * @param file Local file to save contents to
      * @return size of file downloaded
-     * @throws IOException 
+     * @throws IOException
      */
     @Override
     public long fetchObject(String group, String id, File file) throws IOException
@@ -97,7 +113,7 @@ public class DuraCloudObjectStore implements ObjectStore
             Content content = dcStore.getContent(getSpaceID(group), getContentPrefix(group) + id);
             // Get size of downloaded file
             size = Long.valueOf(content.getProperties().get(ContentStore.CONTENT_SIZE));
-            
+
             // Write to a local file
             FileOutputStream out = new FileOutputStream(file);
             InputStream in = content.getStream();
@@ -115,23 +131,38 @@ public class DuraCloudObjectStore implements ObjectStore
         }
         return size;
     }
-    
+
     /**
      * Check if an object exists in DuraCloud
      * @param group Name of 'space' in DuraCloud where object may exist
      * @param id ID/Name of Object to look for
      * @return true if exists, false otherwise
-     * @throws IOException 
+     * @throws IOException
      */
     @Override
     public boolean objectExists(String group, String id) throws IOException
     {
         try
         {
-            return dcStore.getContentProperties(getSpaceID(group), getContentPrefix(group) + id) != null;
+            // Temporarily override the retry Exception Handling in ContentStore
+            dcStore.setRetryExceptionHandler(new ExceptionHandler() {
+                @Override
+                public void handle(Exception ex) {
+                   // do nothing. If content doesn't exist, that's OK!
+                }
+            });
+
+            // If we can read its properties, then this object exists
+            boolean exists = dcStore.getContentProperties(getSpaceID(group), getContentPrefix(group) + id) != null;
+
+            // Reset ExceptionHandler back to our default
+            dcStore.setRetryExceptionHandler(this.defaultExceptionHandler);
+
+            return exists;
         }
         catch (NotFoundException nfE)
         {
+	    // Object doesn't exist
             return false;
         }
         catch (ContentStoreException csE)
@@ -145,7 +176,7 @@ public class DuraCloudObjectStore implements ObjectStore
      * @param group Name of 'space' in DuraCloud where object exists
      * @param id ID/Name of Object to delete
      * @return size of file deleted
-     * @throws IOException 
+     * @throws IOException
      */
     @Override
     public long removeObject(String group, String id) throws IOException
@@ -174,7 +205,7 @@ public class DuraCloudObjectStore implements ObjectStore
      * @param group Name of 'space' in DuraCloud where object should be saved
      * @param file Local file to upload
      * @return size of file deleted
-     * @throws IOException 
+     * @throws IOException
      */
     @Override
     public long transferObject(String group, File file) throws IOException
@@ -208,23 +239,23 @@ public class DuraCloudObjectStore implements ObjectStore
     /**
      * Attempt (multiple times) to upload a local file to DuraCloud.
      * <P>
-     * DuraCloud recommends performing multiple attempts (and even has some of 
+     * DuraCloud recommends performing multiple attempts (and even has some of
      * its retry logic built in), just because Amazon S3 can sometimes experience
      * random request failures (i.e. network hiccups), especially with larger
      * files.
-     * 
+     *
      * @param group Name of 'space' in DuraCloud where object should be saved
      * @param file Local file to upload
-     * @param chkSum Checksum of local file (passed to DuraCloud for 
+     * @param chkSum Checksum of local file (passed to DuraCloud for
      *      verification of a successful upload)
      * @return size of file uploaded
-     * @throws IOException 
+     * @throws IOException
      */
     private long uploadReplica(final String group, final File file, final String chkSum) throws IOException
     {
         try
         {
-            // Initialize a DuraCloud "Retrier" to attempt the upload multiple 
+            // Initialize a DuraCloud "Retrier" to attempt the upload multiple
             // times (3 by default), if at first it fails.
             Retrier retrier = new Retrier();
             //Run the retrier, passing it a custom Retriable & ExceptionHandler
@@ -235,15 +266,15 @@ public class DuraCloudObjectStore implements ObjectStore
                     {
                         // This is the actual method to be retried (if it fails)
                         doUpload(group, file, chkSum);
-                        
+
                         // If upload succeeds, return the length of the file
                         return file.length();
                     }
-                }, 
+                },
                 new ExceptionHandler() {
                     @Override
                     public void handle(Exception ex) {
-                        // Log a custom error if a single upload fails. 
+                        // Log a custom error if a single upload fails.
                         // This gives us a sense of how frequently failure may be happening
                         log.error("Upload of " + file.getName() + " to DuraCloud space " + group + " FAILED (but will try again a total of 3 times)", ex);
                     }
@@ -253,21 +284,20 @@ public class DuraCloudObjectStore implements ObjectStore
         catch (Exception e)
         {
             throw new IOException(e);
-        } 
-        
+        }
     }
 
     /**
      * Actually perform the Upload to DuraCloud.
      * @param group Name of 'space' in DuraCloud where object should be saved
      * @param file Local file to upload
-     * @param chkSum Checksum of local file (passed to DuraCloud for 
+     * @param chkSum Checksum of local file (passed to DuraCloud for
      *      verification of a successful upload)
-     * @throws IOException 
+     * @throws IOException
      */
     private void doUpload(String group, File file, String chkSum) throws IOException
     {
-        //@TODO: We shouldn't need to pass a hardcoded MIME Type. Unfortunately, 
+        //@TODO: We shouldn't need to pass a hardcoded MIME Type. Unfortunately,
         // DuraCloud doesn't (yet) dynamically determine a file's MIME Type.
         String mimeType = "application/octet-stream";
         if(file.getName().endsWith(".zip"))
@@ -303,7 +333,7 @@ public class DuraCloudObjectStore implements ObjectStore
      * @param destGroup destination location (another space in DuraCloud)
      * @param id ID/Name of object to move
      * @return size of moved object
-     * @throws IOException 
+     * @throws IOException
      */
     @Override
     public long moveObject(String srcGroup, String destGroup, String id) throws IOException
@@ -314,7 +344,7 @@ public class DuraCloudObjectStore implements ObjectStore
         {
             Map<String, String> attrs = dcStore.getContentProperties(getSpaceID(srcGroup), getContentPrefix(srcGroup) + id);
             size = Long.valueOf(attrs.get(ContentStore.CONTENT_SIZE));
-            dcStore.moveContent(getSpaceID(srcGroup), getContentPrefix(srcGroup) + id, 
+            dcStore.moveContent(getSpaceID(srcGroup), getContentPrefix(srcGroup) + id,
                                 getSpaceID(destGroup), getContentPrefix(destGroup) + id);
         }
         catch (NotFoundException nfE)
@@ -327,14 +357,14 @@ public class DuraCloudObjectStore implements ObjectStore
         }
         return size;
     }
-    
+
     /**
      * Read a single attribute (i.e. property) of an object within DuraCloud
      * @param group Name of 'space' in DuraCloud where object exists
      * @param id ID/Name of object
      * @param attrName attribute (property) to return the value of
      * @return String value of specified property in DuraCloud
-     * @throws IOException 
+     * @throws IOException
      */
     @Override
     public String objectAttribute(String group, String id, String attrName) throws IOException
@@ -342,7 +372,7 @@ public class DuraCloudObjectStore implements ObjectStore
         try
         {
             Map<String, String> attrs = dcStore.getContentProperties(getSpaceID(group), getContentPrefix(group) + id);
-            
+
             if ("checksum".equals(attrName))
             {
                 return attrs.get(ContentStore.CONTENT_CHECKSUM);
@@ -366,7 +396,7 @@ public class DuraCloudObjectStore implements ObjectStore
             throw new IOException(csE);
         }
     }
-    
+
     /**
      * Read a configuration setting from the duracloud.cfg file
      * @param name name of configuration setting to read
@@ -376,7 +406,7 @@ public class DuraCloudObjectStore implements ObjectStore
     {
         return ConfigurationManager.getProperty("duracloud", name);
     }
-    
+
     /**
      * Returns the Space ID where content should be stored in DuraCloud,
      * based on the passed in Group.
@@ -396,7 +426,7 @@ public class DuraCloudObjectStore implements ObjectStore
         else // otherwise, the passed in group is the Space ID
             return group;
     }
-    
+
     /**
      * Returns the Content prefix that should be used when saving a file
      * to a DuraCloud space.
